@@ -1,0 +1,309 @@
+#!/usr/bin/env node
+
+import fs from 'fs';
+import path from 'path';
+import { readJSON } from '../src/utils/file-io.js';
+import { milliunitsToUSD } from '../src/utils/format.js';
+import config from '../src/config.js';
+
+/**
+ * Parse command line arguments
+ */
+function parseArgs() {
+  const args = {
+    inputDir: null,
+    output: null,
+    debug: false,
+    includeZeroActivity: false,
+    excludedGroups: [...config.defaultExcludedGroups],
+    excludedCategories: [...config.defaultExcludedCategories]
+  };
+
+  process.argv.slice(2).forEach(arg => {
+    if (arg.startsWith('--input-dir=')) {
+      args.inputDir = arg.split('=')[1];
+    } else if (arg.startsWith('--output=')) {
+      args.output = arg.split('=')[1];
+    } else if (arg === '--debug') {
+      args.debug = true;
+    } else if (arg === '--include-zero-activity') {
+      args.includeZeroActivity = true;
+    } else if (arg.startsWith('--exclude-group=')) {
+      args.excludedGroups.push(arg.split('=')[1]);
+    } else if (arg.startsWith('--exclude-category=')) {
+      args.excludedCategories.push(arg.split('=')[1]);
+    }
+  });
+
+  // --input-dir is REQUIRED
+  if (!args.inputDir) {
+    throw new Error('--input-dir is required. Specify the raw data directory (e.g., --input-dir=data/raw/2026-02)');
+  }
+
+  return args;
+}
+
+/**
+ * Build the pivot node and wire "Inflow: Ready to Assign" to it.
+ *
+ * The inflow category lives inside the excluded "Internal Master Category" group,
+ * so it must be handled separately from the main group loop.
+ *
+ * @param {Array} categoryGroups - YNAB category groups (used to find inflow)
+ * @param {Object} ctx - Shared context { nodes, links, nodeSet }
+ * @param {string} pivotNodeId - The pivot node ID
+ */
+function wirePivotAndInflow(categoryGroups, ctx, pivotNodeId) {
+  const { nodes, links, nodeSet } = ctx;
+
+  // Add the pivot node
+  nodes.push({ id: pivotNodeId, type: 'total' });
+
+  // Find and wire "Inflow: Ready to Assign"
+  for (const group of categoryGroups) {
+    if (group.name !== 'Internal Master Category') continue;
+    for (const category of group.categories) {
+      if (category.name !== 'Inflow: Ready to Assign') continue;
+      if (!category.sumTransactionAmount) continue;
+      const inflowId = category.name;
+      if (!nodeSet.has(inflowId)) {
+        nodes.push({
+          id: inflowId,
+          type: 'inflow',
+          sumAmount: category.sumTransactionAmount
+        });
+        nodeSet.add(inflowId);
+      }
+      links.push({
+        source: inflowId,
+        target: pivotNodeId,
+        value: milliunitsToUSD(category.sumTransactionAmount),
+        sumTransactionAmount: category.sumTransactionAmount
+      });
+    }
+  }
+}
+
+/**
+ * Wire group nodes to/from the pivot node based on the sign of their
+ * sumTransactionAmount (positive = income flowing to pivot, negative =
+ * expenses flowing from pivot).
+ *
+ * @param {Object} ctx - Shared context { nodes, links }
+ * @param {string} pivotNodeId - The pivot node ID
+ */
+function wireGroupsToPivot(ctx, pivotNodeId) {
+  const { nodes, links } = ctx;
+
+  nodes
+    .filter(n => n.type === 'group' && n.sumTransactionAmount !== undefined && n.sumTransactionAmount !== 0)
+    .forEach(groupNode => {
+      const amountInDollars = milliunitsToUSD(groupNode.sumTransactionAmount);
+      if (groupNode.sumTransactionAmount > 0) {
+        links.push({
+          source: groupNode.id,
+          target: pivotNodeId,
+          value: amountInDollars,
+          sumTransactionAmount: groupNode.sumTransactionAmount
+        });
+      } else {
+        links.push({
+          source: pivotNodeId,
+          target: groupNode.id,
+          value: amountInDollars,
+          sumTransactionAmount: groupNode.sumTransactionAmount
+        });
+      }
+    });
+}
+
+/**
+ * Transform YNAB category data to D3.js sankey format
+ *
+ * @param {Array} categoryGroups - YNAB category groups with nested categories
+ * @param {Object} options - Transformation options
+ * @param {boolean} options.debug - Enable debug logging
+ * @param {boolean} options.includeZeroActivity - Include links with zero activity (default: false)
+ * @param {string[]} options.excludedGroups - Group names to exclude from the chart
+ * @param {string[]} options.excludedCategories - Category names to exclude from the chart
+ * @returns {Object} D3.js sankey format with nodes and links
+ */
+function transformToD3Sankey(categoryGroups, options = {}) {
+  const {
+    debug = false,
+    includeZeroActivity = false,
+    dateLabel = 'Budget',
+    deltaMilliunits = 0,
+    excludedGroups = config.defaultExcludedGroups,
+    excludedCategories = config.defaultExcludedCategories
+  } = options;
+
+  const nodes = [];
+  const links = [];
+  const nodeSet = new Set();
+  const ctx = { nodes, links, nodeSet };
+
+  let groupCount = 0;
+
+  const excludedGroupSet = new Set(excludedGroups);
+  const excludedCategorySet = new Set(excludedCategories);
+
+  categoryGroups.forEach(group => {
+    let categoryCount = 0;
+    // Skip hidden, deleted or excluded groups
+    if (group.hidden || group.deleted) {
+      if (debug) console.log(`Skipping group: ${group.name} (hidden/deleted)`);
+      return;
+    }
+    if (excludedGroupSet.has(group.name)) {
+      if (debug) console.log(`Skipping group: ${group.name} (excluded)`);
+      return;
+    }
+
+    const groupId = group.name;
+
+    // Process categories within this group
+    if (group.categories && group.categories.length > 0) {
+      group.categories.forEach(category => {
+        // Skip hidden, deleted or excluded categories
+        if (category.hidden || category.deleted) {
+          if (debug) console.log(`  Skipping category: ${category.name} (hidden/deleted)`);
+          return;
+        }
+        if (excludedCategorySet.has(category.name)) {
+          if (debug) console.log(`  Skipping category: ${category.name} (excluded)`);
+          return;
+        }
+        if (!category.sumTransactionAmount && !includeZeroActivity) {
+          if (debug) console.log(`  Skipping category: ${category.name} (zero sumTransactionAmount)`);
+          return;
+        }
+
+        // Add category as a node
+        const categoryId = category.name;
+        if (!nodeSet.has(categoryId)) {
+          nodes.push({
+            id: categoryId,
+            type: 'category',
+            groupName: group.name,
+            sumAmount: category.sumTransactionAmount
+          });
+          nodeSet.add(categoryId);
+          categoryCount++
+        }
+
+        const amountInDollars = milliunitsToUSD(category.sumTransactionAmount);
+
+        links.push({
+          source: groupId,
+          target: categoryId,
+          value: amountInDollars,
+          sumTransactionAmount: category.sumTransactionAmount
+        });
+      });
+    }
+
+    // Add category group as a node if it has visible categories
+    if (!nodeSet.has(groupId) && categoryCount > 0) {
+      nodes.push({
+        id: groupId,
+        type: 'group',
+        value: milliunitsToUSD(group.sumTransactionAmount),
+        sumTransactionAmount: group.sumTransactionAmount
+      });
+      nodeSet.add(groupId);
+      groupCount++;
+    }
+  });
+
+  // Build the pivot node label using the delta from ys-fetch metadata
+  const deltaFormatted = (deltaMilliunits / 1000).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+  const pivotNodeId = `${dateLabel} (${deltaMilliunits >= 0 ? '+' : ''}${deltaFormatted})`;
+
+  wirePivotAndInflow(categoryGroups, ctx, pivotNodeId);
+  wireGroupsToPivot(ctx, pivotNodeId);
+
+  return {
+    nodes,
+    links,
+    metadata: {
+      generatedAt: new Date().toISOString(),
+      nodeCount: nodes.length,
+      linkCount: links.length,
+      groupCount: groupCount
+    }
+  };
+}
+
+/**
+ * Main function
+ */
+async function main() {
+  console.log('🎨 D3.js Sankey Data Generator\n');
+
+  const args = parseArgs(); // Will throw if --input-dir not provided
+
+  const inputDir = args.inputDir;
+  const categoriesFile = path.join(inputDir, 'categories.json');
+  const metadataFile = path.join(inputDir, 'metadata.json');
+
+  console.log(`Reading from: ${inputDir}`);
+
+  // Verify input files exist
+  if (!fs.existsSync(categoriesFile)) {
+    throw new Error(`Categories file not found: ${categoriesFile}`);
+  }
+  if (!fs.existsSync(metadataFile)) {
+    throw new Error(`Metadata file not found: ${metadataFile}`);
+  }
+
+  // Load categories and metadata
+  const categoryGroups = readJSON(categoriesFile);
+  const metadata = readJSON(metadataFile);
+  console.log(`   ✓ Loaded ${categoryGroups.length} category groups`);
+  console.log(`   ✓ Loaded metadata\n`);
+
+  // Determine output path
+  const dateLabel = path.basename(inputDir);
+
+  // Transform to D3 format
+  console.log('Transforming to D3 sankey format...');
+  const d3Data = transformToD3Sankey(categoryGroups, {
+    debug: args.debug,
+    includeZeroActivity: args.includeZeroActivity,
+    dateLabel,
+    deltaMilliunits: metadata.deltaMilliunits,
+    excludedGroups: args.excludedGroups,
+    excludedCategories: args.excludedCategories
+  });
+
+  console.log(`   ✓ ${d3Data.nodes.length} nodes`);
+  console.log(`   ✓ ${d3Data.links.length} links`);
+  console.log(`   ✓ ${d3Data.metadata.groupCount} groups`);
+
+  const outputJson = args.output || path.join(process.cwd(), 'data', 'processed', `d3-sankey-${dateLabel}.json`);
+
+  // Ensure output directory exists
+  const outputDir = path.dirname(outputJson);
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+
+  // Forward financial summary and dateRange from ys-fetch metadata into the output
+  d3Data.metadata.dateRange = dateLabel;
+  d3Data.metadata.incomeMilliunits = metadata.incomeMilliunits;
+  d3Data.metadata.expenseMilliunits = metadata.expenseMilliunits;
+  d3Data.metadata.deltaMilliunits = metadata.deltaMilliunits;
+
+  // Save JSON output (pretty-printed for easy inspection)
+  console.log('Saving output...');
+  fs.writeFileSync(outputJson, JSON.stringify(d3Data, null, 2));
+  console.log(`   ✓ ${outputJson}`);
+
+  console.log('\n✅ Done!');
+}
+
+main().catch(error => {
+  console.error('\n❌ Error:', error.message);
+  process.exit(1);
+});

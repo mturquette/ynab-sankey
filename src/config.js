@@ -22,7 +22,18 @@ const config = {
   app: {
     defaultRange: process.env.DEFAULT_RANGE || 'month',
     outputDir: process.env.OUTPUT_DIR || './output'
-  }
+  },
+
+  // Category and group naming conventions
+  // The YNAB API returns "Uncategorized" for account-to-account transfers.
+  // We rename these to a more descriptive label throughout the pipeline.
+  transferCategoryName: 'Transfer Payments',
+  uncategorizedName: 'Uncategorized',
+
+  // Default exclusions for the sankey chart
+  // These are filtered out in ys-build-d3 unless overridden via CLI
+  defaultExcludedGroups: ['Internal Master Category'],
+  defaultExcludedCategories: ['Internal Master Category', 'Transfer Payments']
 };
 
 /**

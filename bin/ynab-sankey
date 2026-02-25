@@ -3,18 +3,18 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
-import { getCacheKey } from './utils/cache-manager.js';
-import { getDateRange } from './utils/date-range.js';
+import { getCacheKey } from '../src/utils/cache-manager.js';
+import { getDateRange } from '../src/utils/date-range.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 /**
  * Main orchestrator for YNAB Sankey Generator
- * Chains together: fetch → process → render
+ * Chains together: ys-fetch → ys-build-d3 → ys-render
  *
  * Usage:
- *   node src/index.js [options]
+ *   ynab-sankey [options]
  *
  * Options:
  *   --range=<range>          Date range (default: month)
@@ -62,7 +62,7 @@ function parseArgs() {
  */
 function runUtility(scriptName, args = []) {
   return new Promise((resolve, reject) => {
-    const scriptPath = join(__dirname, '../bin', scriptName);
+    const scriptPath = join(__dirname, scriptName);
     const child = spawn('node', [scriptPath, ...args], {
       stdio: 'inherit',
       cwd: process.cwd()
@@ -102,22 +102,22 @@ async function main() {
     if (args.force) fetchArgs.push('--force');
     if (args.debug) fetchArgs.push('--debug');
 
-    await runUtility('fetch-data.js', fetchArgs);
+    await runUtility('ys-fetch', fetchArgs);
 
-    // Step 2: Process data
-    console.log('\n⚙️  Step 2/3: Processing data...');
-    const processArgs = [`--input-dir=data/raw/${cacheKey}`];
-    if (args.debug) processArgs.push('--debug');
+    // Step 2: Transform to D3 sankey format
+    console.log('\n⚙️  Step 2/3: Transforming data to D3 sankey format...');
+    const d3Args = [`--input-dir=data/raw/${cacheKey}`];
+    if (args.debug) d3Args.push('--debug');
 
-    await runUtility('process-data.js', processArgs);
+    await runUtility('ys-build-d3', d3Args);
 
     // Step 3: Render visualization
     console.log('\n🎨 Step 3/3: Generating visualization...');
-    const renderArgs = [`--input=data/processed/ynab-${cacheKey}.json`];
+    const renderArgs = [`--input=data/processed/d3-sankey-${cacheKey}.json`];
     if (args.output) renderArgs.push(`--output=${args.output}`);
     if (args.open) renderArgs.push('--open');
 
-    await runUtility('render-sankey.js', renderArgs);
+    await runUtility('ys-render', renderArgs);
 
     console.log('\n✅ Done! HTML file saved to output/');
     if (!args.open) {

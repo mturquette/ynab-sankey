@@ -1,0 +1,21 @@
+{
+  "name": "ynab-sankey",
+  "version": "1.0.0",
+  "description": "Visualize YNAB budget data with interactive Sankey diagrams",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "fetch": "node bin/fetch-data.js",
+    "process": "node bin/process-data.js",
+    "render": "node bin/render-sankey.js",
+    "generate": "node src/index.js",
+    "clear-cache": "rm -rf data"
+  },
+  "keywords": ["ynab", "sankey", "budget", "visualization", "finance"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.4.0"
+  }
+}

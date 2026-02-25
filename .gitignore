@@ -1,0 +1,38 @@
+# Environment variables
+.env
+.env.local
+*.env
+
+# Dependencies
+node_modules/
+
+# Output files
+output/
+
+# Cached data
+data/
+!data/.gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code
+.claude/settings.local.json

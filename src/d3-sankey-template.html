@@ -247,6 +247,7 @@
       switch (node.type) {
         case 'asset':     return '#2196F3'; // Blue
         case 'liability': return '#FF9800'; // Orange
+        case 'loan':      return '#E91E63'; // Pink
         case 'group':     return groupColor(displayName(node));
         case 'category':  return categoryColor(displayName(node));
         default:          return '#999';
@@ -258,7 +259,8 @@
       'Deposit Accounts',
       'Credit Cards',
       'Category Groups',
-      'Budget Categories'
+      'Budget Categories',
+      'Loan Accounts'
     ];
 
     // Custom alignment function that maps each node to its explicit column
@@ -326,8 +328,9 @@
       .attr("fill", d => getNodeColor(d))
       .on("mouseover", function(event, d) {
         const typeLabels = {
-          asset: 'Asset Account',
-          liability: 'Liability Account',
+          asset: 'Deposit Account',
+          liability: 'Credit Card',
+          loan: 'Loan Account',
           group: 'Category Group',
           category: 'Budget Category'
         };

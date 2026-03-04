@@ -7,15 +7,16 @@
  * Reads transactions.json, accounts.json, categories.json, and metadata.json
  * from a raw data directory and produces a nodes+links JSON file for rendering.
  *
- * Flow layout (4 columns):
- *   Asset Accounts → Liability Accounts → Category Groups → Categories
+ * Flow layout (5 columns):
+ *   Asset Accounts → Credit Cards → Category Groups → Categories → Loan Accounts
  *
  * Link types:
- *   1. CC Payment:      Asset account  → Liability account (on-budget CC transfers)
- *   2. CC Expense:      Liability acct → Category group    (spending on credit cards)
- *   3. Direct Expense:  Asset account  → Category group    (checking/debit expenses)
- *   4. Off-budget Xfer: Asset account  → Category group    (mortgage/loan payments)
- *   5. Group→Category:  Category group → Category          (unchanged from prior)
+ *   1. CC Payment:      Asset account  → Credit card        (on-budget CC transfers)
+ *   2. CC Expense:      Credit card    → Category group     (spending on credit cards)
+ *   3. Direct Expense:  Asset account  → Category group     (checking/debit expenses)
+ *   4. Off-budget Xfer: Asset account  → Category group     (mortgage/loan payments)
+ *   5. Group→Category:  Category group → Category           (unchanged from prior)
+ *   6. Loan Paydown:    Category       → Loan account       (category → off-budget account)
  */
 
 import fs from 'fs';
@@ -151,6 +152,10 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
   // key = "groupNodeId|catNodeId", value = total milliunits (positive)
   const expensesByGroupAndCategory = new Map();
 
+  // key = "catNodeId|acctNodeId", value = total milliunits (positive)
+  // Tracks category → off-budget loan account links (loan paydowns)
+  const loanPaymentsByCategoryAndAccount = new Map();
+
   // Running totals for metadata stat cards
   let totalIncomeMilliunits = 0;
   let totalCCPaymentsMilliunits = 0;
@@ -207,6 +212,7 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
         }
 
         // Rule 4: off-budget transfer (mortgage, loan) — use real category
+        // Also record the category → off-budget account link for the loan column
         const groupName = categoryToGroup.get(entry.category_name);
         if (groupName && !excludedGroupSet.has(groupName) &&
             !excludedCategorySet.has(entry.category_name)) {
@@ -215,9 +221,13 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
           const catNodeId = makeCategoryNodeId(entry.category_name);
           addToMap(expensesByAccountAndGroup, `${acctNodeId}|${groupNodeId}`, absAmount);
           addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
+          if (targetAccount) {
+            const loanAcctNodeId = makeAccountNodeId(targetAccount);
+            addToMap(loanPaymentsByCategoryAndAccount, `${catNodeId}|${loanAcctNodeId}`, absAmount);
+          }
           totalLoanPaymentsMilliunits += absAmount;
           if (debug) {
-            console.log(`  Off-budget: ${account.name} → ${groupName} → ${entry.category_name}: ${milliunitsToUSD(absAmount)}`);
+            console.log(`  Off-budget: ${account.name} → ${groupName} → ${entry.category_name} → ${targetAccount?.name || '?'}: ${milliunitsToUSD(absAmount)}`);
           }
         }
         return;
@@ -248,6 +258,7 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
     ccPaymentsBySourceAndTarget,
     expensesByAccountAndGroup,
     expensesByGroupAndCategory,
+    loanPaymentsByCategoryAndAccount,
     totalIncomeMilliunits,
     totalCCPaymentsMilliunits,
     totalLoanPaymentsMilliunits
@@ -431,6 +442,54 @@ function buildGroupCategoryLinks(expensesByGroupAndCategory, categoryToGroup, ct
   }
 }
 
+/**
+ * Create Category→LoanAccount links (Link Type 6) and off-budget loan
+ * account nodes in column 4.
+ *
+ * @param {Map} loanPaymentsByCategoryAndAccount
+ * @param {Map} accountById
+ * @param {Object} ctx - { nodes, links, nodeSet }
+ * @param {boolean} debug
+ */
+function buildLoanAccountLinks(loanPaymentsByCategoryAndAccount, accountById, ctx, debug) {
+  const { nodes, links, nodeSet } = ctx;
+
+  for (const [key, amountMilliunits] of loanPaymentsByCategoryAndAccount) {
+    const [catNodeId, loanAcctNodeId] = key.split('|');
+
+    // Ensure the loan account node exists
+    if (!nodeSet.has(loanAcctNodeId)) {
+      // Find the account object to get its metadata
+      const accountName = loanAcctNodeId.replace(/^acct:/, '');
+      let accountType = 'otherLiability';
+      for (const [, acct] of accountById) {
+        if (acct.name === accountName) {
+          accountType = acct.type;
+          break;
+        }
+      }
+
+      nodes.push({
+        id: loanAcctNodeId,
+        name: accountName,
+        type: 'loan',
+        column: 4,
+        accountType,
+        onBudget: false
+      });
+      nodeSet.add(loanAcctNodeId);
+      if (debug) console.log(`  Loan account node: ${accountName}`);
+    }
+
+    links.push({
+      source: catNodeId,
+      target: loanAcctNodeId,
+      value: milliunitsToUSD(amountMilliunits),
+      linkType: 'loanPaydown'
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Main transform
 // ---------------------------------------------------------------------------
@@ -476,7 +535,8 @@ function transformToD3Sankey(transactions, accounts, categoryGroups, options = {
     console.log(`  Income entries: ${agg.incomeByAccount.size} accounts`);
     console.log(`  CC payments: ${agg.ccPaymentsBySourceAndTarget.size} pairs`);
     console.log(`  Expense account→group links: ${agg.expensesByAccountAndGroup.size}`);
-    console.log(`  Group→category links: ${agg.expensesByGroupAndCategory.size}\n`);
+    console.log(`  Group→category links: ${agg.expensesByGroupAndCategory.size}`);
+    console.log(`  Category→loan account links: ${agg.loanPaymentsByCategoryAndAccount.size}\n`);
   }
 
   // Build nodes and links in order
@@ -486,6 +546,7 @@ function transformToD3Sankey(transactions, accounts, categoryGroups, options = {
   buildTransferLinks(agg.ccPaymentsBySourceAndTarget, accountById, ctx);
   buildExpenseLinks(agg.expensesByAccountAndGroup, ctx, debug);
   buildGroupCategoryLinks(agg.expensesByGroupAndCategory, categoryToGroup, ctx, debug);
+  buildLoanAccountLinks(agg.loanPaymentsByCategoryAndAccount, accountById, ctx, debug);
 
   const groupCount = nodes.filter(n => n.type === 'group').length;
 

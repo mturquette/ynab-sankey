@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{TITLE}}</title>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" crossorigin="anonymous"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: #f5f5f5;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1600px;
+      margin: 0 auto;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+      overflow: hidden;
+    }
+
+    header {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 30px;
+      text-align: center;
+    }
+
+    h1 {
+      font-size: 2em;
+      margin-bottom: 10px;
+    }
+
+    .date-range {
+      font-size: 1.1em;
+      opacity: 0.9;
+    }
+
+    .timestamp {
+      font-size: 0.85em;
+      opacity: 0.7;
+      margin-top: 5px;
+    }
+
+    #sankey {
+      width: 100%;
+      height: calc(100vh - 280px);
+      min-height: 500px;
+      max-height: 1200px;
+      padding: 20px;
+    }
+
+    .info {
+      padding: 20px 30px;
+      background: #f8f9fa;
+      border-top: 1px solid #dee2e6;
+    }
+
+    .info h2 {
+      font-size: 1.1em;
+      margin-bottom: 10px;
+      color: #495057;
+    }
+
+    .info p {
+      color: #6c757d;
+      line-height: 1.6;
+      font-size: 0.95em;
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px;
+      margin-top: 15px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .legend-color {
+      width: 20px;
+      height: 20px;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+
+    .legend-label {
+      font-size: 0.9em;
+      color: #495057;
+    }
+
+    footer {
+      padding: 15px 30px;
+      text-align: center;
+      color: #6c757d;
+      font-size: 0.85em;
+      background: #f8f9fa;
+      border-top: 1px solid #dee2e6;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>{{TITLE}}</h1>
+      <div class="date-range">{{SUBTITLE}}</div>
+      <div class="timestamp">Generated: {{TIMESTAMP}}</div>
+    </header>
+
+    <div id="sankey"></div>
+
+    <div class="info">
+      <h2>About This Diagram</h2>
+      <p>
+        This Sankey diagram visualizes your YNAB budget flow. Money flows from accounts on the left,
+        through category groups, to individual budget categories. The width of each flow represents
+        the relative amount of money. Hover over nodes and links to see exact amounts.
+      </p>
+      <div class="legend">{{LEGEND}}</div>
+    </div>
+
+    <footer>
+      YNAB Budget Flow Visualization | Powered by Plotly.js
+    </footer>
+  </div>
+
+  <script>
+    const data = [{{PLOTLY_DATA}}];
+    const layout = {{PLOTLY_LAYOUT}};
+    const config = {
+      responsive: true,
+      displayModeBar: true,
+      displaylogo: false,
+      modeBarButtonsToRemove: ['pan2d', 'lasso2d', 'select2d']
+    };
+
+    Plotly.newPlot('sankey', data, layout, config)
+      .then(() => {
+        console.log('Sankey diagram rendered successfully');
+      })
+      .catch(error => {
+        console.error('Plotly rendering error:', error);
+        document.getElementById('sankey').innerHTML =
+          '<div style="padding: 50px; text-align: center; color: red;">' +
+          '<h2>Rendering Error</h2>' +
+          '<p>' + error.message + '</p>' +
+          '</div>';
+      });
+
+    window.addEventListener('resize', () => {
+      Plotly.Plots.resize('sankey');
+    });
+  </script>
+</body>
+</html>

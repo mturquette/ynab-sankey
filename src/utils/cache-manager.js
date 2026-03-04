@@ -33,20 +33,20 @@ export function getCacheKey(dateRange) {
 /**
  * Gets the cache directory path for a date range
  * @param {Object} dateRange - Date range object
- * @param {string} dataType - Type of data: 'raw' or 'processed'
+ * @param {string} dataType - Type of data: 'ynab' or 'plotly'
  * @returns {string} Full path to cache directory
  */
-export function getCachePath(dateRange, dataType = 'raw') {
+export function getCachePath(dateRange, dataType = 'ynab') {
   const cacheKey = getCacheKey(dateRange);
   const baseDir = process.cwd();
 
-  if (dataType === 'raw') {
-    return join(baseDir, 'data', 'raw', cacheKey);
-  } else if (dataType === 'processed') {
-    return join(baseDir, 'data', 'processed');
+  if (dataType === 'ynab') {
+    return join(baseDir, 'output', 'ynab', cacheKey);
+  } else if (dataType === 'plotly') {
+    return join(baseDir, 'output', 'plotly', cacheKey);
   }
 
-  throw new Error(`Invalid dataType: ${dataType}. Must be 'raw' or 'processed'`);
+  throw new Error(`Invalid dataType: ${dataType}. Must be 'ynab' or 'plotly'`);
 }
 
 /**
@@ -69,7 +69,7 @@ export function getCacheFilePath(dateRange, dataType, filename) {
  */
 export function isCacheValid(dateRange, maxAgeHours = 24) {
   try {
-    const cacheDir = getCachePath(dateRange, 'raw');
+    const cacheDir = getCachePath(dateRange, 'ynab');
 
     // Check if all required files exist
     const requiredFiles = [
@@ -131,7 +131,7 @@ export function isCacheValid(dateRange, maxAgeHours = 24) {
  */
 export function clearCache(olderThanDays = 30) {
   const baseDir = process.cwd();
-  const rawCacheDir = join(baseDir, 'data', 'raw');
+  const rawCacheDir = join(baseDir, 'output', 'ynab');
 
   if (!fileExists(rawCacheDir)) {
     return 0;
@@ -186,7 +186,7 @@ export function clearCache(olderThanDays = 30) {
  */
 export function getLatestCache() {
   const baseDir = process.cwd();
-  const rawCacheDir = join(baseDir, 'data', 'raw');
+  const rawCacheDir = join(baseDir, 'output', 'ynab');
 
   if (!fileExists(rawCacheDir)) {
     return null;

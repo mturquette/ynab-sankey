@@ -6,14 +6,12 @@
 # Dependencies
 node_modules/
 
-# Output files
+# Output and cached files
 output/
-
-# Cached data
-data/
-!data/.gitkeep
-!data/raw/.gitkeep
-!data/processed/.gitkeep
+!output/.gitkeep
+!output/ynab/.gitkeep
+!output/plotly/.gitkeep
+!output/render/.gitkeep
 
 # Logs
 npm-debug.log*

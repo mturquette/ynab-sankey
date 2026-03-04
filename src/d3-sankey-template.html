@@ -220,7 +220,8 @@
     document.getElementById('loan-payments').textContent = formatCurrency(loanPaymentsMilliunits / 1000);
 
     // Set up dimensions — wider to accommodate 4 columns of nodes
-    const margin = { top: 20, right: 20, bottom: 20, left: 20 };
+    // Extra top margin for column header labels
+    const margin = { top: 50, right: 20, bottom: 20, left: 20 };
     const width = 1600 - margin.left - margin.right;
 
     // Dynamic height based on node count (more nodes → taller chart)
@@ -252,10 +253,26 @@
       }
     }
 
+    // Column labels (indexed by column number)
+    const COLUMN_COUNT = 4;
+    const columnLabels = [
+      'Deposit Accounts',
+      'Credit Cards',
+      'Category Groups',
+      'Budget Categories'
+    ];
+
+    // Custom alignment function that uses the explicit `column` property
+    // set by ys-build-d3, falling back to sankeyLeft for any node without one.
+    function customAlign(node, n) {
+      if (node.column !== undefined) return node.column;
+      return d3.sankeyLeft(node, n);
+    }
+
     // Create sankey generator
     const sankey = d3.sankey()
       .nodeId(d => d.id)
-      .nodeAlign(d3.sankeyLeft)
+      .nodeAlign(customAlign)
       .nodeWidth(15)
       .nodePadding(10)
       .extent([[1, 5], [width - 1, height - 5]]);
@@ -330,7 +347,7 @@
         tooltip.style("opacity", 0);
       });
 
-    // Add labels
+    // Add node labels
     node.append("text")
       .attr("x", d => d.x0 < width / 2 ? d.x1 + 6 : d.x0 - 6)
       .attr("y", d => (d.y1 + d.y0) / 2)
@@ -338,6 +355,38 @@
       .attr("text-anchor", d => d.x0 < width / 2 ? "start" : "end")
       .text(d => displayName(d))
       .style("fill", "#333");
+
+    // ── Column header labels ───────────────────────────────────────────
+    // Compute the x-center of each column from the laid-out node positions.
+    const columnXPositions = new Map();
+    graph.nodes.forEach(n => {
+      const col = n.column !== undefined ? n.column : 0;
+      const centerX = (n.x0 + n.x1) / 2;
+      if (!columnXPositions.has(col)) {
+        columnXPositions.set(col, []);
+      }
+      columnXPositions.get(col).push(centerX);
+    });
+
+    // Average x per column (all nodes in a column share the same x, but
+    // averaging handles any floating-point variation).
+    const columnCenters = new Map();
+    for (const [col, xs] of columnXPositions) {
+      columnCenters.set(col, xs.reduce((a, b) => a + b, 0) / xs.length);
+    }
+
+    svg.append("g")
+      .attr("class", "column-headers")
+      .selectAll("text")
+      .data(columnLabels.map((label, i) => ({ label, col: i })))
+      .join("text")
+      .attr("x", d => columnCenters.get(d.col) || 0)
+      .attr("y", -12)
+      .attr("text-anchor", "middle")
+      .attr("font-size", "13px")
+      .attr("font-weight", "600")
+      .attr("fill", "#666")
+      .text(d => d.label);
   </script>
 </body>
 </html>

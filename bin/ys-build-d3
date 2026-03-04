@@ -316,10 +316,12 @@ function buildAccountNodes(accountById, ccPaymentsBySourceAndTarget, expensesByA
     const type = classifyAccount(account);
     if (!type) continue; // skip off-budget loans, mortgages, etc.
 
+    const column = type === 'asset' ? 0 : 1;
     nodes.push({
       id: nodeId,
       name: account.name,
       type,
+      column,
       accountType: account.type,
       onBudget: account.on_budget
     });
@@ -374,7 +376,8 @@ function buildExpenseLinks(expensesByAccountAndGroup, ctx, debug) {
       nodes.push({
         id: groupNodeId,
         name: groupName,
-        type: 'group'
+        type: 'group',
+        column: 2
       });
       nodeSet.add(groupNodeId);
       if (debug) console.log(`  Group node: ${groupName}`);
@@ -412,6 +415,7 @@ function buildGroupCategoryLinks(expensesByGroupAndCategory, categoryToGroup, ct
         id: catNodeId,
         name: categoryName,
         type: 'category',
+        column: 3,
         groupName
       });
       nodeSet.add(catNodeId);

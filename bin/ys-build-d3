@@ -121,15 +121,24 @@ function classifyAccount(account) {
  * Single-pass aggregation of all transactions into the maps needed to build
  * the Sankey nodes and links.
  *
+ * Uses a unified sign-based direction model:
+ *   - Deduplication: Based solely on transfer_transaction_id (sign-agnostic)
+ *   - Direction: Sign determines source vs target for ALL transactions
+ *     - Negative amount: account is SOURCE (money leaving)
+ *     - Positive amount: account is TARGET (money arriving)
+ *
  * Classification rules (applied per entry, where "entry" is a subtransaction
  * if the parent has splits, otherwise the parent transaction itself):
  *
- *   1. Positive-side transfer → SKIP (avoid double-counting)
- *   2. Income (category = "Inflow: Ready to Assign") → incomeByAccount
- *   3. Negative transfer to on-budget liability → ccPaymentsBySourceAndTarget
- *   4. Negative transfer to off-budget account → expensesByAccountAndGroup
- *      (using the real category_name, which YNAB attaches to these transfers)
- *   5. Regular expense → expensesByAccountAndGroup + expensesByGroupAndCategory
+ *   TRANSFERS (has transfer_account_id):
+ *     - CC Payment: asset → on-budget liability → ccPaymentsBySourceAndTarget
+ *     - Loan Payment: asset → off-budget account → expenses (via category)
+ *     - Loan Disbursement: off-budget → asset → incomeByAccount
+ *     - Other transfers (asset↔asset): skipped
+ *
+ *   NON-TRANSFERS:
+ *     - Income (category = "Inflow: Ready to Assign") → incomeByAccount
+ *     - Expenses (outflows) → expensesByAccountAndGroup + expensesByGroupAndCategory
  *
  * @param {Array} transactions
  * @param {Map} accountById
@@ -165,6 +174,9 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
     map.set(key, (map.get(key) || 0) + amount);
   }
 
+  // Track processed transfer IDs for deduplication (sign-agnostic)
+  const processedTransferIds = new Set();
+
   transactions.forEach(txn => {
     // Expand subtransactions if present; otherwise process the txn itself.
     // Subtransaction entries inherit account fields from the parent.
@@ -182,65 +194,92 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
       const account = accountById.get(entry.account_id);
       if (!account) return;
 
-      // ── Rule 1: skip positive side of transfers (dedup) ──────────────
-      if (entry.transfer_account_id && entry.amount > 0) {
-        return;
-      }
+      const absAmount = Math.abs(entry.amount);
+      const isOutflow = entry.amount < 0;
 
-      // ── Rule 2: income ───────────────────────────────────────────────
-      if (entry.category_name === 'Inflow: Ready to Assign') {
-        addToMap(incomeByAccount, entry.account_id, entry.amount);
-        totalIncomeMilliunits += entry.amount;
-        return;
-      }
+      // ═══ TRANSFERS ═══
+      if (entry.transfer_account_id) {
+        // Dedupe: skip if partner already processed
+        if (entry.transfer_transaction_id &&
+            processedTransferIds.has(entry.transfer_transaction_id)) {
+          return;
+        }
+        // Mark this transfer as processed
+        if (entry.id) {
+          processedTransferIds.add(entry.id);
+        }
 
-      // ── Rule 3 & 4: negative-side transfers ──────────────────────────
-      if (entry.transfer_account_id && entry.amount < 0) {
-        const targetAccount = accountById.get(entry.transfer_account_id);
-        const absAmount = Math.abs(entry.amount);
+        const partnerAccount = accountById.get(entry.transfer_account_id);
 
-        // Rule 3: on-budget CC payment
-        if (targetAccount && targetAccount.on_budget &&
-            config.liabilityAccountTypes.includes(targetAccount.type)) {
-          const key = `${entry.account_id}|${entry.transfer_account_id}`;
-          addToMap(ccPaymentsBySourceAndTarget, key, absAmount);
+        // Determine source/target from sign
+        const sourceAccount = isOutflow ? account : partnerAccount;
+        const targetAccount = isOutflow ? partnerAccount : account;
+
+        // Classify by account types
+        const sourceType = sourceAccount ? classifyAccount(sourceAccount) : null;
+        const targetType = targetAccount ? classifyAccount(targetAccount) : null;
+
+        // CC Payment: asset → on-budget liability
+        if (sourceType === 'asset' && targetType === 'liability' && targetAccount?.on_budget) {
+          addToMap(ccPaymentsBySourceAndTarget, `${sourceAccount.id}|${targetAccount.id}`, absAmount);
           totalCCPaymentsMilliunits += absAmount;
           if (debug) {
-            console.log(`  CC payment: ${account.name} → ${targetAccount.name}: ${milliunitsToUSD(absAmount)}`);
+            console.log(`  CC payment: ${sourceAccount.name} → ${targetAccount.name}: ${milliunitsToUSD(absAmount)}`);
           }
           return;
         }
 
-        // Rule 4: off-budget transfer (mortgage, loan) — use real category
-        // Also record the category → off-budget account link for the loan column
-        const groupName = categoryToGroup.get(entry.category_name);
-        if (groupName && !excludedGroupSet.has(groupName) &&
-            !excludedCategorySet.has(entry.category_name)) {
-          const acctNodeId = makeAccountNodeId(account);
-          const groupNodeId = makeGroupNodeId(groupName);
-          const catNodeId = makeCategoryNodeId(entry.category_name);
-          addToMap(expensesByAccountAndGroup, `${acctNodeId}|${groupNodeId}`, absAmount);
-          addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
-          if (targetAccount) {
+        // Loan payment: asset → off-budget (route through category)
+        if (sourceType === 'asset' && targetAccount && !targetAccount.on_budget) {
+          const groupName = categoryToGroup.get(entry.category_name);
+          if (groupName && !excludedGroupSet.has(groupName) && !excludedCategorySet.has(entry.category_name)) {
+            const acctNodeId = makeAccountNodeId(sourceAccount);
+            const groupNodeId = makeGroupNodeId(groupName);
+            const catNodeId = makeCategoryNodeId(entry.category_name);
             const loanAcctNodeId = makeAccountNodeId(targetAccount);
+            addToMap(expensesByAccountAndGroup, `${acctNodeId}|${groupNodeId}`, absAmount);
+            addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
             addToMap(loanPaymentsByCategoryAndAccount, `${catNodeId}|${loanAcctNodeId}`, absAmount);
+            totalLoanPaymentsMilliunits += absAmount;
+            if (debug) {
+              console.log(`  Loan payment: ${sourceAccount.name} → ${groupName} → ${entry.category_name} → ${targetAccount.name}: ${milliunitsToUSD(absAmount)}`);
+            }
           }
-          totalLoanPaymentsMilliunits += absAmount;
+          return;
+        }
+
+        // Loan disbursement: off-budget → asset (treat as income)
+        if (sourceAccount && !sourceAccount.on_budget && targetType === 'asset') {
+          addToMap(incomeByAccount, targetAccount.id, absAmount);
+          totalIncomeMilliunits += absAmount;
           if (debug) {
-            console.log(`  Off-budget: ${account.name} → ${groupName} → ${entry.category_name} → ${targetAccount?.name || '?'}: ${milliunitsToUSD(absAmount)}`);
+            console.log(`  Loan disbursement: ${sourceAccount.name} → ${targetAccount.name}: ${milliunitsToUSD(absAmount)}`);
           }
+          return;
+        }
+
+        // Other transfers (asset↔asset, liability↔liability, etc.) - skip
+        if (debug) {
+          console.log(`  Skipped transfer: ${account.name} ↔ ${partnerAccount?.name || '?'}: ${milliunitsToUSD(absAmount)}`);
         }
         return;
       }
 
-      // ── Rule 5: regular expense ──────────────────────────────────────
-      if (entry.amount < 0) {
+      // ═══ NON-TRANSFERS ═══
+
+      // Income
+      if (entry.category_name === 'Inflow: Ready to Assign') {
+        addToMap(incomeByAccount, entry.account_id, absAmount);
+        totalIncomeMilliunits += absAmount;
+        return;
+      }
+
+      // Expenses (outflows only)
+      if (isOutflow) {
         const groupName = categoryToGroup.get(entry.category_name);
-        if (!groupName || excludedGroupSet.has(groupName) ||
-            excludedCategorySet.has(entry.category_name)) {
+        if (!groupName || excludedGroupSet.has(groupName) || excludedCategorySet.has(entry.category_name)) {
           return;
         }
-        const absAmount = Math.abs(entry.amount);
         const acctNodeId = makeAccountNodeId(account);
         const groupNodeId = makeGroupNodeId(groupName);
         const catNodeId = makeCategoryNodeId(entry.category_name);
@@ -248,8 +287,7 @@ function aggregateTransactions(transactions, accountById, categoryToGroup, optio
         addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
       }
 
-      // Positive non-transfer, non-income entries (refunds, credits) are
-      // intentionally skipped for now to keep the diagram clean.
+      // Positive non-transfer, non-income (refunds) - skip for now
     });
   });
 

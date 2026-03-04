@@ -20,7 +20,7 @@
     }
 
     .container {
-      max-width: 1400px;
+      max-width: 1800px;
       margin: 0 auto;
       background: white;
       border-radius: 12px;
@@ -71,7 +71,7 @@
 
     .node text {
       pointer-events: none;
-      font-size: 12px;
+      font-size: 11px;
       font-weight: 500;
     }
 
@@ -83,6 +83,15 @@
 
     .link:hover {
       stroke-opacity: 0.6;
+    }
+
+    .link-transfer {
+      stroke-dasharray: 6, 3;
+      stroke-opacity: 0.25;
+    }
+
+    .link-transfer:hover {
+      stroke-opacity: 0.5;
     }
 
     .tooltip {
@@ -110,7 +119,7 @@
     .stats {
       display: flex;
       justify-content: center;
-      gap: 30px;
+      gap: 20px;
       margin: 20px 0;
       flex-wrap: wrap;
     }
@@ -157,6 +166,14 @@
           <div class="stat-label">Net</div>
           <div class="stat-value" id="net">$0</div>
         </div>
+        <div class="stat">
+          <div class="stat-label">CC Payments</div>
+          <div class="stat-value" id="cc-payments">$0</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Loan Payments</div>
+          <div class="stat-value" id="loan-payments">$0</div>
+        </div>
       </div>
       <div id="sankey"></div>
     </div>
@@ -184,19 +201,33 @@
       }).format(value);
     }
 
+    // Display name for a node (strip internal prefix)
+    function displayName(node) {
+      return node.name || node.id;
+    }
+
     // Update stats
     const incomeMilliunits = data.metadata?.incomeMilliunits || 0;
     const expenseMilliunits = data.metadata?.expenseMilliunits || 0;
     const deltaMilliunits = data.metadata?.deltaMilliunits || 0;
+    const ccPaymentsMilliunits = data.metadata?.totalCCPaymentsMilliunits || 0;
+    const loanPaymentsMilliunits = data.metadata?.totalLoanPaymentsMilliunits || 0;
 
     document.getElementById('total-income').textContent = formatCurrency(incomeMilliunits / 1000);
     document.getElementById('total-expenses').textContent = formatCurrency(Math.abs(expenseMilliunits) / 1000);
     document.getElementById('net').textContent = formatCurrency(deltaMilliunits / 1000);
+    document.getElementById('cc-payments').textContent = formatCurrency(ccPaymentsMilliunits / 1000);
+    document.getElementById('loan-payments').textContent = formatCurrency(loanPaymentsMilliunits / 1000);
 
-    // Set up dimensions
+    // Set up dimensions — wider to accommodate 4 columns of nodes
     const margin = { top: 20, right: 20, bottom: 20, left: 20 };
-    const width = 1200 - margin.left - margin.right;
-    const height = 600 - margin.top - margin.bottom;
+    const width = 1600 - margin.left - margin.right;
+
+    // Dynamic height based on node count (more nodes → taller chart)
+    const nodeCount = data.nodes.length;
+    const baseHeight = 600;
+    const dynamicHeight = Math.max(baseHeight, nodeCount * 18);
+    const height = dynamicHeight - margin.top - margin.bottom;
 
     // Create SVG
     const svg = d3.select("#sankey")
@@ -210,11 +241,14 @@
     const groupColor = d3.scaleOrdinal(d3.schemeTableau10);
     const categoryColor = d3.scaleOrdinal(d3.schemePastel1);
 
+    // Node colors by type
     function getNodeColor(node) {
-      if (node.type === 'group') {
-        return groupColor(node.id);
-      } else {
-        return categoryColor(node.id);
+      switch (node.type) {
+        case 'asset':     return '#2196F3'; // Blue
+        case 'liability': return '#FF9800'; // Orange
+        case 'group':     return groupColor(displayName(node));
+        case 'category':  return categoryColor(displayName(node));
+        default:          return '#999';
       }
     }
 
@@ -240,23 +274,25 @@
       .selectAll(".link")
       .data(graph.links)
       .join("path")
-      .attr("class", "link")
+      .attr("class", d => d.linkType === 'ccPayment' ? "link link-transfer" : "link")
       .attr("d", d3.sankeyLinkHorizontal())
       .attr("stroke", d => getNodeColor(d.source))
       .attr("stroke-width", d => Math.max(1, d.width))
       .on("mouseover", function(event, d) {
         d3.select(this).attr("stroke-opacity", 0.8);
+        const label = d.linkType === 'ccPayment' ? 'CC Payment' : 'Activity';
         tooltip
           .style("opacity", 1)
           .html(`
-            <strong>${d.source.id}</strong> → <strong>${d.target.id}</strong><br/>
-            Activity: ${formatCurrency(d.value)}
+            <strong>${displayName(d.source)}</strong> → <strong>${displayName(d.target)}</strong><br/>
+            ${label}: ${formatCurrency(d.value)}
           `)
           .style("left", (event.pageX + 10) + "px")
           .style("top", (event.pageY - 10) + "px");
       })
-      .on("mouseout", function() {
-        d3.select(this).attr("stroke-opacity", 0.3);
+      .on("mouseout", function(event, d) {
+        d3.select(this).attr("stroke-opacity",
+          d.linkType === 'ccPayment' ? 0.25 : 0.3);
         tooltip.style("opacity", 0);
       });
 
@@ -274,11 +310,17 @@
       .attr("width", d => d.x1 - d.x0)
       .attr("fill", d => getNodeColor(d))
       .on("mouseover", function(event, d) {
+        const typeLabels = {
+          asset: 'Asset Account',
+          liability: 'Liability Account',
+          group: 'Category Group',
+          category: 'Budget Category'
+        };
         tooltip
           .style("opacity", 1)
           .html(`
-            <strong>${d.id}</strong><br/>
-            Type: ${d.type}<br/>
+            <strong>${displayName(d)}</strong><br/>
+            Type: ${typeLabels[d.type] || d.type}<br/>
             Total: ${formatCurrency(d.value)}
           `)
           .style("left", (event.pageX + 10) + "px")
@@ -294,7 +336,7 @@
       .attr("y", d => (d.y1 + d.y0) / 2)
       .attr("dy", "0.35em")
       .attr("text-anchor", d => d.x0 < width / 2 ? "start" : "end")
-      .text(d => d.id)
+      .text(d => displayName(d))
       .style("fill", "#333");
   </script>
 </body>

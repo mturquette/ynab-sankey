@@ -30,6 +30,11 @@ const config = {
   transferCategoryName: 'Transfer Payments',
   uncategorizedName: 'Uncategorized',
 
+  // Account type classification for the Sankey diagram
+  // Asset accounts appear in the leftmost column; liabilities in the next column
+  assetAccountTypes: ['checking', 'savings'],
+  liabilityAccountTypes: ['creditCard'],
+
   // Default exclusions for the sankey chart
   // These are filtered out in ys-build-d3 unless overridden via CLI
   defaultExcludedGroups: ['Internal Master Category'],

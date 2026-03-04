@@ -1,13 +1,36 @@
 #!/usr/bin/env node
 
+/**
+ * ys-build-d3
+ * Transforms cached YNAB data into D3.js sankey JSON format.
+ *
+ * Reads transactions.json, accounts.json, categories.json, and metadata.json
+ * from a raw data directory and produces a nodes+links JSON file for rendering.
+ *
+ * Flow layout (4 columns):
+ *   Asset Accounts → Liability Accounts → Category Groups → Categories
+ *
+ * Link types:
+ *   1. CC Payment:      Asset account  → Liability account (on-budget CC transfers)
+ *   2. CC Expense:      Liability acct → Category group    (spending on credit cards)
+ *   3. Direct Expense:  Asset account  → Category group    (checking/debit expenses)
+ *   4. Off-budget Xfer: Asset account  → Category group    (mortgage/loan payments)
+ *   5. Group→Category:  Category group → Category          (unchanged from prior)
+ */
+
 import fs from 'fs';
 import path from 'path';
 import { readJSON } from '../src/utils/file-io.js';
 import { milliunitsToUSD } from '../src/utils/format.js';
 import config from '../src/config.js';
 
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
+
 /**
  * Parse command line arguments
+ * @returns {Object} Parsed arguments
  */
 function parseArgs() {
   const args = {
@@ -35,7 +58,6 @@ function parseArgs() {
     }
   });
 
-  // --input-dir is REQUIRED
   if (!args.inputDir) {
     throw new Error('--input-dir is required. Specify the raw data directory (e.g., --input-dir=data/raw/2026-02)');
   }
@@ -43,97 +65,384 @@ function parseArgs() {
   return args;
 }
 
+// ---------------------------------------------------------------------------
+// Lookup map builders
+// ---------------------------------------------------------------------------
+
 /**
- * Build the pivot node and wire "Inflow: Ready to Assign" to it.
+ * Build a map of account ID → account object.
  *
- * The inflow category lives inside the excluded "Internal Master Category" group,
- * so it must be handled separately from the main group loop.
- *
- * @param {Array} categoryGroups - YNAB category groups (used to find inflow)
- * @param {Object} ctx - Shared context { nodes, links, nodeSet }
- * @param {string} pivotNodeId - The pivot node ID
+ * @param {Array} accounts - YNAB account objects
+ * @returns {Map<string, Object>}
  */
-function wirePivotAndInflow(categoryGroups, ctx, pivotNodeId) {
-  const { nodes, links, nodeSet } = ctx;
+function buildAccountMap(accounts) {
+  const map = new Map();
+  accounts.forEach(a => map.set(a.id, a));
+  return map;
+}
 
-  // Add the pivot node
-  nodes.push({ id: pivotNodeId, type: 'total' });
+/**
+ * Build a map of category name → group name from the YNAB category groups.
+ * Skips hidden/deleted entries so downstream consumers only see active data.
+ *
+ * @param {Array} categoryGroups - YNAB category group objects
+ * @returns {Map<string, string>}
+ */
+function buildCategoryToGroupMap(categoryGroups) {
+  const map = new Map();
+  categoryGroups.forEach(group => {
+    if (group.hidden || group.deleted) return;
+    (group.categories || []).forEach(cat => {
+      if (cat.hidden || cat.deleted) return;
+      map.set(cat.name, group.name);
+    });
+  });
+  return map;
+}
 
-  // Find and wire "Inflow: Ready to Assign"
-  for (const group of categoryGroups) {
-    if (group.name !== 'Internal Master Category') continue;
-    for (const category of group.categories) {
-      if (category.name !== 'Inflow: Ready to Assign') continue;
-      if (!category.sumTransactionAmount) continue;
-      const inflowId = category.name;
-      if (!nodeSet.has(inflowId)) {
-        nodes.push({
-          id: inflowId,
-          type: 'inflow',
-          sumAmount: category.sumTransactionAmount
-        });
-        nodeSet.add(inflowId);
+/**
+ * Classify an account as 'asset', 'liability', or null (unknown/irrelevant).
+ *
+ * @param {Object} account - YNAB account object
+ * @returns {string|null}
+ */
+function classifyAccount(account) {
+  if (config.assetAccountTypes.includes(account.type)) return 'asset';
+  if (config.liabilityAccountTypes.includes(account.type)) return 'liability';
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Transaction aggregation (single-pass classifier)
+// ---------------------------------------------------------------------------
+
+/**
+ * Single-pass aggregation of all transactions into the maps needed to build
+ * the Sankey nodes and links.
+ *
+ * Classification rules (applied per entry, where "entry" is a subtransaction
+ * if the parent has splits, otherwise the parent transaction itself):
+ *
+ *   1. Positive-side transfer → SKIP (avoid double-counting)
+ *   2. Income (category = "Inflow: Ready to Assign") → incomeByAccount
+ *   3. Negative transfer to on-budget liability → ccPaymentsBySourceAndTarget
+ *   4. Negative transfer to off-budget account → expensesByAccountAndGroup
+ *      (using the real category_name, which YNAB attaches to these transfers)
+ *   5. Regular expense → expensesByAccountAndGroup + expensesByGroupAndCategory
+ *
+ * @param {Array} transactions
+ * @param {Map} accountById
+ * @param {Map} categoryToGroup
+ * @param {Object} options - { debug, excludedGroupSet, excludedCategorySet }
+ * @returns {Object} Aggregation maps
+ */
+function aggregateTransactions(transactions, accountById, categoryToGroup, options) {
+  const { debug = false, excludedGroupSet, excludedCategorySet } = options;
+
+  // key = accountId, value = total milliunits (positive)
+  const incomeByAccount = new Map();
+
+  // key = "sourceAcctId|targetAcctId", value = total milliunits (positive)
+  const ccPaymentsBySourceAndTarget = new Map();
+
+  // key = "acctNodeId|groupNodeId", value = total milliunits (positive)
+  const expensesByAccountAndGroup = new Map();
+
+  // key = "groupNodeId|catNodeId", value = total milliunits (positive)
+  const expensesByGroupAndCategory = new Map();
+
+  // Running totals for metadata stat cards
+  let totalIncomeMilliunits = 0;
+  let totalCCPaymentsMilliunits = 0;
+  let totalLoanPaymentsMilliunits = 0;
+
+  function addToMap(map, key, amount) {
+    map.set(key, (map.get(key) || 0) + amount);
+  }
+
+  transactions.forEach(txn => {
+    // Expand subtransactions if present; otherwise process the txn itself.
+    // Subtransaction entries inherit account fields from the parent.
+    const entries = (txn.subtransactions && txn.subtransactions.length > 0)
+      ? txn.subtransactions.map(sub => ({
+          ...sub,
+          account_id: txn.account_id,
+          account_name: txn.account_name,
+          // subtransactions may have their own transfer_account_id
+          transfer_account_id: sub.transfer_account_id ?? txn.transfer_account_id
+        }))
+      : [txn];
+
+    entries.forEach(entry => {
+      const account = accountById.get(entry.account_id);
+      if (!account) return;
+
+      // ── Rule 1: skip positive side of transfers (dedup) ──────────────
+      if (entry.transfer_account_id && entry.amount > 0) {
+        return;
       }
-      links.push({
-        source: inflowId,
-        target: pivotNodeId,
-        value: milliunitsToUSD(category.sumTransactionAmount),
-        sumTransactionAmount: category.sumTransactionAmount
-      });
+
+      // ── Rule 2: income ───────────────────────────────────────────────
+      if (entry.category_name === 'Inflow: Ready to Assign') {
+        addToMap(incomeByAccount, entry.account_id, entry.amount);
+        totalIncomeMilliunits += entry.amount;
+        return;
+      }
+
+      // ── Rule 3 & 4: negative-side transfers ──────────────────────────
+      if (entry.transfer_account_id && entry.amount < 0) {
+        const targetAccount = accountById.get(entry.transfer_account_id);
+        const absAmount = Math.abs(entry.amount);
+
+        // Rule 3: on-budget CC payment
+        if (targetAccount && targetAccount.on_budget &&
+            config.liabilityAccountTypes.includes(targetAccount.type)) {
+          const key = `${entry.account_id}|${entry.transfer_account_id}`;
+          addToMap(ccPaymentsBySourceAndTarget, key, absAmount);
+          totalCCPaymentsMilliunits += absAmount;
+          if (debug) {
+            console.log(`  CC payment: ${account.name} → ${targetAccount.name}: ${milliunitsToUSD(absAmount)}`);
+          }
+          return;
+        }
+
+        // Rule 4: off-budget transfer (mortgage, loan) — use real category
+        const groupName = categoryToGroup.get(entry.category_name);
+        if (groupName && !excludedGroupSet.has(groupName) &&
+            !excludedCategorySet.has(entry.category_name)) {
+          const acctNodeId = makeAccountNodeId(account);
+          const groupNodeId = makeGroupNodeId(groupName);
+          const catNodeId = makeCategoryNodeId(entry.category_name);
+          addToMap(expensesByAccountAndGroup, `${acctNodeId}|${groupNodeId}`, absAmount);
+          addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
+          totalLoanPaymentsMilliunits += absAmount;
+          if (debug) {
+            console.log(`  Off-budget: ${account.name} → ${groupName} → ${entry.category_name}: ${milliunitsToUSD(absAmount)}`);
+          }
+        }
+        return;
+      }
+
+      // ── Rule 5: regular expense ──────────────────────────────────────
+      if (entry.amount < 0) {
+        const groupName = categoryToGroup.get(entry.category_name);
+        if (!groupName || excludedGroupSet.has(groupName) ||
+            excludedCategorySet.has(entry.category_name)) {
+          return;
+        }
+        const absAmount = Math.abs(entry.amount);
+        const acctNodeId = makeAccountNodeId(account);
+        const groupNodeId = makeGroupNodeId(groupName);
+        const catNodeId = makeCategoryNodeId(entry.category_name);
+        addToMap(expensesByAccountAndGroup, `${acctNodeId}|${groupNodeId}`, absAmount);
+        addToMap(expensesByGroupAndCategory, `${groupNodeId}|${catNodeId}`, absAmount);
+      }
+
+      // Positive non-transfer, non-income entries (refunds, credits) are
+      // intentionally skipped for now to keep the diagram clean.
+    });
+  });
+
+  return {
+    incomeByAccount,
+    ccPaymentsBySourceAndTarget,
+    expensesByAccountAndGroup,
+    expensesByGroupAndCategory,
+    totalIncomeMilliunits,
+    totalCCPaymentsMilliunits,
+    totalLoanPaymentsMilliunits
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Node ID helpers (prevent collisions between accounts and categories)
+// ---------------------------------------------------------------------------
+
+function makeAccountNodeId(account) {
+  return `acct:${account.name}`;
+}
+
+function makeGroupNodeId(groupName) {
+  return `group:${groupName}`;
+}
+
+function makeCategoryNodeId(categoryName) {
+  return `cat:${categoryName}`;
+}
+
+// ---------------------------------------------------------------------------
+// Node and link builders
+// ---------------------------------------------------------------------------
+
+/**
+ * Create account nodes (both asset and liability) for all accounts that
+ * have at least one transaction in the aggregated data.
+ *
+ * @param {Map} accountById
+ * @param {Map} ccPaymentsBySourceAndTarget - for detecting active CC accounts
+ * @param {Map} expensesByAccountAndGroup - for detecting active asset/CC accounts
+ * @param {Object} ctx - { nodes, links, nodeSet }
+ * @param {boolean} debug
+ */
+function buildAccountNodes(accountById, ccPaymentsBySourceAndTarget, expensesByAccountAndGroup, ctx, debug) {
+  const { nodes, nodeSet } = ctx;
+
+  // Collect all account IDs that appear in aggregated data
+  const activeAccountIds = new Set();
+
+  for (const key of ccPaymentsBySourceAndTarget.keys()) {
+    const [sourceId, targetId] = key.split('|');
+    activeAccountIds.add(sourceId);
+    activeAccountIds.add(targetId);
+  }
+
+  for (const key of expensesByAccountAndGroup.keys()) {
+    const acctNodeId = key.split('|')[0];
+    // Find the actual account ID from the node ID prefix
+    for (const [id, acct] of accountById) {
+      if (makeAccountNodeId(acct) === acctNodeId) {
+        activeAccountIds.add(id);
+        break;
+      }
     }
+  }
+
+  for (const [id, account] of accountById) {
+    if (!activeAccountIds.has(id)) continue;
+
+    const nodeId = makeAccountNodeId(account);
+    if (nodeSet.has(nodeId)) continue;
+
+    const type = classifyAccount(account);
+    if (!type) continue; // skip off-budget loans, mortgages, etc.
+
+    nodes.push({
+      id: nodeId,
+      name: account.name,
+      type,
+      accountType: account.type,
+      onBudget: account.on_budget
+    });
+    nodeSet.add(nodeId);
+
+    if (debug) console.log(`  Account node: ${account.name} (${type})`);
   }
 }
 
 /**
- * Wire group nodes to/from the pivot node based on the sign of their
- * sumTransactionAmount (positive = income flowing to pivot, negative =
- * expenses flowing from pivot).
+ * Create Account→Account links for CC payments (Link Type 1).
  *
- * @param {Object} ctx - Shared context { nodes, links }
- * @param {string} pivotNodeId - The pivot node ID
+ * @param {Map} ccPaymentsBySourceAndTarget
+ * @param {Map} accountById
+ * @param {Object} ctx - { nodes, links, nodeSet }
  */
-function wireGroupsToPivot(ctx, pivotNodeId) {
-  const { nodes, links } = ctx;
+function buildTransferLinks(ccPaymentsBySourceAndTarget, accountById, ctx) {
+  const { links } = ctx;
 
-  nodes
-    .filter(n => n.type === 'group' && n.sumTransactionAmount !== undefined && n.sumTransactionAmount !== 0)
-    .forEach(groupNode => {
-      const amountInDollars = milliunitsToUSD(groupNode.sumTransactionAmount);
-      if (groupNode.sumTransactionAmount > 0) {
-        links.push({
-          source: groupNode.id,
-          target: pivotNodeId,
-          value: amountInDollars,
-          sumTransactionAmount: groupNode.sumTransactionAmount
-        });
-      } else {
-        links.push({
-          source: pivotNodeId,
-          target: groupNode.id,
-          value: amountInDollars,
-          sumTransactionAmount: groupNode.sumTransactionAmount
-        });
-      }
+  for (const [key, amountMilliunits] of ccPaymentsBySourceAndTarget) {
+    const [sourceAcctId, targetAcctId] = key.split('|');
+    const sourceAcct = accountById.get(sourceAcctId);
+    const targetAcct = accountById.get(targetAcctId);
+    if (!sourceAcct || !targetAcct) continue;
+
+    links.push({
+      source: makeAccountNodeId(sourceAcct),
+      target: makeAccountNodeId(targetAcct),
+      value: milliunitsToUSD(amountMilliunits),
+      linkType: 'ccPayment'
     });
+  }
 }
 
 /**
- * Transform YNAB category data to D3.js sankey format
+ * Create Account→Group links for expenses (Link Types 2, 3, 4).
+ * Also ensures group nodes exist.
  *
- * @param {Array} categoryGroups - YNAB category groups with nested categories
- * @param {Object} options - Transformation options
- * @param {boolean} options.debug - Enable debug logging
- * @param {boolean} options.includeZeroActivity - Include links with zero activity (default: false)
- * @param {string[]} options.excludedGroups - Group names to exclude from the chart
- * @param {string[]} options.excludedCategories - Category names to exclude from the chart
- * @returns {Object} D3.js sankey format with nodes and links
+ * @param {Map} expensesByAccountAndGroup
+ * @param {Object} ctx - { nodes, links, nodeSet }
+ * @param {boolean} debug
  */
-function transformToD3Sankey(categoryGroups, options = {}) {
+function buildExpenseLinks(expensesByAccountAndGroup, ctx, debug) {
+  const { nodes, links, nodeSet } = ctx;
+
+  for (const [key, amountMilliunits] of expensesByAccountAndGroup) {
+    const [acctNodeId, groupNodeId] = key.split('|');
+    const groupName = groupNodeId.replace(/^group:/, '');
+
+    // Ensure group node exists
+    if (!nodeSet.has(groupNodeId)) {
+      nodes.push({
+        id: groupNodeId,
+        name: groupName,
+        type: 'group'
+      });
+      nodeSet.add(groupNodeId);
+      if (debug) console.log(`  Group node: ${groupName}`);
+    }
+
+    links.push({
+      source: acctNodeId,
+      target: groupNodeId,
+      value: milliunitsToUSD(amountMilliunits),
+      linkType: 'expense'
+    });
+  }
+}
+
+/**
+ * Create Group→Category links (Link Type 5).
+ * Also creates category nodes.
+ *
+ * @param {Map} expensesByGroupAndCategory
+ * @param {Map} categoryToGroup - for groupName metadata on category nodes
+ * @param {Object} ctx - { nodes, links, nodeSet }
+ * @param {boolean} debug
+ */
+function buildGroupCategoryLinks(expensesByGroupAndCategory, categoryToGroup, ctx, debug) {
+  const { nodes, links, nodeSet } = ctx;
+
+  for (const [key, amountMilliunits] of expensesByGroupAndCategory) {
+    const [groupNodeId, catNodeId] = key.split('|');
+    const categoryName = catNodeId.replace(/^cat:/, '');
+    const groupName = groupNodeId.replace(/^group:/, '');
+
+    // Ensure category node exists
+    if (!nodeSet.has(catNodeId)) {
+      nodes.push({
+        id: catNodeId,
+        name: categoryName,
+        type: 'category',
+        groupName
+      });
+      nodeSet.add(catNodeId);
+      if (debug) console.log(`  Category node: ${categoryName}`);
+    }
+
+    links.push({
+      source: groupNodeId,
+      target: catNodeId,
+      value: milliunitsToUSD(amountMilliunits),
+      linkType: 'groupCategory'
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main transform
+// ---------------------------------------------------------------------------
+
+/**
+ * Transform YNAB data into D3.js sankey format with account columns.
+ *
+ * @param {Array} transactions - YNAB transaction objects
+ * @param {Array} accounts - YNAB account objects
+ * @param {Array} categoryGroups - YNAB category group objects
+ * @param {Object} options
+ * @returns {Object} D3.js sankey data { nodes, links, metadata }
+ */
+function transformToD3Sankey(transactions, accounts, categoryGroups, options = {}) {
   const {
     debug = false,
-    includeZeroActivity = false,
-    dateLabel = 'Budget',
-    deltaMilliunits = 0,
     excludedGroups = config.defaultExcludedGroups,
     excludedCategories = config.defaultExcludedCategories
   } = options;
@@ -143,85 +452,38 @@ function transformToD3Sankey(categoryGroups, options = {}) {
   const nodeSet = new Set();
   const ctx = { nodes, links, nodeSet };
 
-  let groupCount = 0;
-
   const excludedGroupSet = new Set(excludedGroups);
   const excludedCategorySet = new Set(excludedCategories);
 
-  categoryGroups.forEach(group => {
-    let categoryCount = 0;
-    // Skip hidden, deleted or excluded groups
-    if (group.hidden || group.deleted) {
-      if (debug) console.log(`Skipping group: ${group.name} (hidden/deleted)`);
-      return;
-    }
-    if (excludedGroupSet.has(group.name)) {
-      if (debug) console.log(`Skipping group: ${group.name} (excluded)`);
-      return;
-    }
+  // Build lookup maps
+  const accountById = buildAccountMap(accounts);
+  const categoryToGroup = buildCategoryToGroupMap(categoryGroups);
 
-    const groupId = group.name;
+  if (debug) console.log('Aggregating transactions...');
 
-    // Process categories within this group
-    if (group.categories && group.categories.length > 0) {
-      group.categories.forEach(category => {
-        // Skip hidden, deleted or excluded categories
-        if (category.hidden || category.deleted) {
-          if (debug) console.log(`  Skipping category: ${category.name} (hidden/deleted)`);
-          return;
-        }
-        if (excludedCategorySet.has(category.name)) {
-          if (debug) console.log(`  Skipping category: ${category.name} (excluded)`);
-          return;
-        }
-        if (!category.sumTransactionAmount && !includeZeroActivity) {
-          if (debug) console.log(`  Skipping category: ${category.name} (zero sumTransactionAmount)`);
-          return;
-        }
-
-        // Add category as a node
-        const categoryId = category.name;
-        if (!nodeSet.has(categoryId)) {
-          nodes.push({
-            id: categoryId,
-            type: 'category',
-            groupName: group.name,
-            sumAmount: category.sumTransactionAmount
-          });
-          nodeSet.add(categoryId);
-          categoryCount++
-        }
-
-        const amountInDollars = milliunitsToUSD(category.sumTransactionAmount);
-
-        links.push({
-          source: groupId,
-          target: categoryId,
-          value: amountInDollars,
-          sumTransactionAmount: category.sumTransactionAmount
-        });
-      });
-    }
-
-    // Add category group as a node if it has visible categories
-    if (!nodeSet.has(groupId) && categoryCount > 0) {
-      nodes.push({
-        id: groupId,
-        type: 'group',
-        value: milliunitsToUSD(group.sumTransactionAmount),
-        sumTransactionAmount: group.sumTransactionAmount
-      });
-      nodeSet.add(groupId);
-      groupCount++;
-    }
+  // Single-pass transaction classification
+  const agg = aggregateTransactions(transactions, accountById, categoryToGroup, {
+    debug,
+    excludedGroupSet,
+    excludedCategorySet
   });
 
-  // Build the pivot node label using the delta from ys-fetch metadata
-  const deltaFormatted = (deltaMilliunits / 1000).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
-  const pivotNodeId = `${dateLabel} (${deltaMilliunits >= 0 ? '+' : ''}${deltaFormatted})`;
+  if (debug) {
+    console.log(`  Income entries: ${agg.incomeByAccount.size} accounts`);
+    console.log(`  CC payments: ${agg.ccPaymentsBySourceAndTarget.size} pairs`);
+    console.log(`  Expense account→group links: ${agg.expensesByAccountAndGroup.size}`);
+    console.log(`  Group→category links: ${agg.expensesByGroupAndCategory.size}\n`);
+  }
 
-  wirePivotAndInflow(categoryGroups, ctx, pivotNodeId);
-  wireGroupsToPivot(ctx, pivotNodeId);
+  // Build nodes and links in order
+  if (debug) console.log('Building nodes and links...');
+
+  buildAccountNodes(accountById, agg.ccPaymentsBySourceAndTarget, agg.expensesByAccountAndGroup, ctx, debug);
+  buildTransferLinks(agg.ccPaymentsBySourceAndTarget, accountById, ctx);
+  buildExpenseLinks(agg.expensesByAccountAndGroup, ctx, debug);
+  buildGroupCategoryLinks(agg.expensesByGroupAndCategory, categoryToGroup, ctx, debug);
+
+  const groupCount = nodes.filter(n => n.type === 'group').length;
 
   return {
     nodes,
@@ -230,56 +492,70 @@ function transformToD3Sankey(categoryGroups, options = {}) {
       generatedAt: new Date().toISOString(),
       nodeCount: nodes.length,
       linkCount: links.length,
-      groupCount: groupCount
+      groupCount,
+      totalIncomeMilliunits: agg.totalIncomeMilliunits,
+      totalCCPaymentsMilliunits: agg.totalCCPaymentsMilliunits,
+      totalLoanPaymentsMilliunits: agg.totalLoanPaymentsMilliunits
     }
   };
 }
 
-/**
- * Main function
- */
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 async function main() {
   console.log('🎨 D3.js Sankey Data Generator\n');
 
-  const args = parseArgs(); // Will throw if --input-dir not provided
+  const args = parseArgs();
 
   const inputDir = args.inputDir;
   const categoriesFile = path.join(inputDir, 'categories.json');
   const metadataFile = path.join(inputDir, 'metadata.json');
+  const transactionsFile = path.join(inputDir, 'transactions.json');
+  const accountsFile = path.join(inputDir, 'accounts.json');
 
   console.log(`Reading from: ${inputDir}`);
 
   // Verify input files exist
-  if (!fs.existsSync(categoriesFile)) {
-    throw new Error(`Categories file not found: ${categoriesFile}`);
-  }
-  if (!fs.existsSync(metadataFile)) {
-    throw new Error(`Metadata file not found: ${metadataFile}`);
+  for (const [label, file] of [
+    ['Categories', categoriesFile],
+    ['Metadata', metadataFile],
+    ['Transactions', transactionsFile],
+    ['Accounts', accountsFile]
+  ]) {
+    if (!fs.existsSync(file)) {
+      throw new Error(`${label} file not found: ${file}`);
+    }
   }
 
-  // Load categories and metadata
+  // Load all data files
   const categoryGroups = readJSON(categoriesFile);
   const metadata = readJSON(metadataFile);
+  const transactions = readJSON(transactionsFile);
+  const accounts = readJSON(accountsFile);
+
   console.log(`   ✓ Loaded ${categoryGroups.length} category groups`);
+  console.log(`   ✓ Loaded ${transactions.length} transactions`);
+  console.log(`   ✓ Loaded ${accounts.length} accounts`);
   console.log(`   ✓ Loaded metadata\n`);
 
-  // Determine output path
   const dateLabel = path.basename(inputDir);
 
   // Transform to D3 format
   console.log('Transforming to D3 sankey format...');
-  const d3Data = transformToD3Sankey(categoryGroups, {
+  const d3Data = transformToD3Sankey(transactions, accounts, categoryGroups, {
     debug: args.debug,
     includeZeroActivity: args.includeZeroActivity,
-    dateLabel,
-    deltaMilliunits: metadata.deltaMilliunits,
     excludedGroups: args.excludedGroups,
     excludedCategories: args.excludedCategories
   });
 
-  console.log(`   ✓ ${d3Data.nodes.length} nodes`);
+  const assetCount = d3Data.nodes.filter(n => n.type === 'asset').length;
+  const liabilityCount = d3Data.nodes.filter(n => n.type === 'liability').length;
+
+  console.log(`   ✓ ${d3Data.nodes.length} nodes (${assetCount} asset, ${liabilityCount} liability, ${d3Data.metadata.groupCount} groups)`);
   console.log(`   ✓ ${d3Data.links.length} links`);
-  console.log(`   ✓ ${d3Data.metadata.groupCount} groups`);
 
   const outputJson = args.output || path.join(process.cwd(), 'data', 'processed', `d3-sankey-${dateLabel}.json`);
 
@@ -289,13 +565,13 @@ async function main() {
     fs.mkdirSync(outputDir, { recursive: true });
   }
 
-  // Forward financial summary and dateRange from ys-fetch metadata into the output
+  // Forward financial summary from ys-fetch metadata + new aggregation totals
   d3Data.metadata.dateRange = dateLabel;
   d3Data.metadata.incomeMilliunits = metadata.incomeMilliunits;
   d3Data.metadata.expenseMilliunits = metadata.expenseMilliunits;
   d3Data.metadata.deltaMilliunits = metadata.deltaMilliunits;
 
-  // Save JSON output (pretty-printed for easy inspection)
+  // Save JSON output
   console.log('Saving output...');
   fs.writeFileSync(outputJson, JSON.stringify(d3Data, null, 2));
   console.log(`   ✓ ${outputJson}`);

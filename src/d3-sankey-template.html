@@ -254,7 +254,6 @@
     }
 
     // Column labels (indexed by column number)
-    const COLUMN_COUNT = 4;
     const columnLabels = [
       'Deposit Accounts',
       'Credit Cards',
@@ -262,11 +261,10 @@
       'Budget Categories'
     ];
 
-    // Custom alignment function that uses the explicit `column` property
-    // set by ys-build-d3, falling back to sankeyLeft for any node without one.
-    function customAlign(node, n) {
-      if (node.column !== undefined) return node.column;
-      return d3.sankeyLeft(node, n);
+    // Custom alignment function that maps each node to its explicit column
+    // (set by ys-build-d3). Every node must have a `column` property.
+    function customAlign(node) {
+      return node.column;
     }
 
     // Create sankey generator

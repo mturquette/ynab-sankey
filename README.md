@@ -405,6 +405,13 @@ cat data/raw/2026-03/metadata.json | jq '.'
 
 # Inspect the D3 sankey nodes
 cat data/processed/d3-sankey-2026-03.json | jq '.nodes[] | {id, type}'
+
+# Group together all Liabilities
+cat data/raw/2020-01-01_2026-03-04/accounts.json | jq '.[] | select(.type as $a | ["personalLoan", "otherLiability", "mortgage", "autoLoan"] | index($a) ) | {name, type, closed}' 
+
+# List all of the account types
+cat data/raw/2020-01-01_2026-03-04/accounts.json | jq '.[].type' | sort | uniq
+
 ```
 
 ### Batch Processing Multiple Months

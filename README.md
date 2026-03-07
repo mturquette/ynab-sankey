@@ -4,14 +4,15 @@ Visualize your YNAB budget data with beautiful, interactive Sankey diagrams. See
 
 ## Features
 
-- **Interactive Visualizations**: Hover over flows to see detailed amounts
-- **Central Pivot Node**: Date range label with net income/loss delta
-- **Financial Summary**: Stat cards showing Total Income, Total Expenses, and Net
+- **Interactive Visualizations**: Hover over flows to see detailed amounts with native Plotly controls
+- **Directional Arrows**: Native arrow visualization showing money flow direction
+- **Financial Summary**: Stat cards showing Total Income, Total Expenses, Net, CC Payments, and Loan Payments
 - **Smart Caching**: Fetch once, iterate on building/rendering without hitting API rate limits
-- **Modular Pipeline**: Run individual stages (fetch, build-d3, render) or chain them together
+- **Modular Pipeline**: Run individual stages (fetch, build, render) or chain them together
 - **Self-Contained HTML**: Generated files work offline, no web server required
 - **Flexible Date Ranges**: Current month, year-to-date, or arbitrary date ranges
 - **Configurable Exclusions**: Filter groups/categories via shared config or CLI options
+- **Responsive Design**: Beautiful card-based layout with gradient backgrounds
 
 ## Prerequisites
 
@@ -82,26 +83,28 @@ This tool uses a modular, three-stage pipeline with intelligent caching:
 │ • Sums transaction amounts per category and group               │
 │ • Computes income/expense/delta for financial summary           │
 │ • Respects 24-hour cache TTL (configurable)                     │
-│ Output: data/raw/<date-key>/*.json                              │
+│ Output: output/ynab/<date-key>/*.json                           │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STAGE 2: ys-build-d3                                            │
-│ Transforms cached data into D3.js sankey format                 │
-│ • Builds category and group nodes with links                    │
-│ • Creates central pivot node with income/expense delta          │
-│ • Wires inflow and group nodes to/from pivot                    │
+│ STAGE 2: ys-build-plotly                                        │
+│ Transforms cached data into Plotly.js sankey format             │
+│ • Groups accounts by type (Deposits, Credit Cards, Loans, etc)  │
+│ • Creates index-based node references (0, 1, 2...)              │
+│ • Maps flows: Account → Group → Category → Liability            │
 │ • Filters excluded groups/categories (configurable)             │
-│ Output: data/processed/d3-sankey-<date-key>.json                │
+│ • Generates inline styling and directional arrows               │
+│ Output: output/plotly/plotly-sankey-<date-key>.json             │
 └─────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STAGE 3: ys-render                                              │
+│ STAGE 3: ys-render-plotly                                       │
 │ Generates self-contained HTML visualization                     │
-│ • Injects D3 sankey JSON into HTML template                     │
-│ • Loads D3.js and d3-sankey from CDN                            │
-│ • Renders interactive SVG with hover tooltips                   │
-│ Output: output/ynab-sankey-d3-<date-key>.html                   │
+│ • Injects Plotly sankey JSON into HTML template                 │
+│ • Loads Plotly.js from CDN                                      │
+│ • Renders interactive Sankey with native controls               │
+│ • Includes stat cards and responsive layout                     │
+│ Output: output/sankey_<date-key>.html                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -120,13 +123,16 @@ This tool uses a modular, three-stage pipeline with intelligent caching:
 ### NPM Scripts
 
 ```bash
-# Full pipeline (fetch → build-d3 → render)
+# Full pipeline (fetch → build → render)
 npm run generate
 
 # Individual stages
 npm run fetch              # Fetch and cache YNAB data
-npm run build-d3           # Transform cached data to D3 sankey format
-npm run render             # Render HTML from D3 sankey JSON
+npm run build              # Transform cached data to Plotly sankey format
+npm run render             # Render HTML from Plotly sankey JSON
+
+# Convenience scripts
+npm run build:open         # Build and render, then open in browser
 
 # Utilities
 npm run clear-cache        # Delete all cached data
@@ -158,18 +164,18 @@ npm run fetch -- [options]
   --debug                  Enable debug logging
   --debugverbose           Verbose transaction logging
 
-# Build D3 utility
-npm run build-d3 -- [options]
+# Build Plotly utility
+npm run build -- [options]
   --input-dir=<path>       Input raw data directory
-  --output=<path>          Output D3 sankey JSON file
+  --output=<path>          Output Plotly sankey JSON file
   --exclude-group=<name>   Exclude a group (repeatable, appends to defaults)
   --exclude-category=<name> Exclude a category (repeatable, appends to defaults)
-  --include-zero-activity  Include categories with zero spending
+  --include-zero-activity  Include accounts with zero activity
   --debug                  Enable debug logging
 
 # Render utility
 npm run render -- [options]
-  --input=<path>           Input D3 sankey JSON file
+  --input=<path>           Input Plotly sankey JSON file
   --output=<path>          Output HTML file path
   --open                   Open in browser after rendering
 ```
@@ -203,31 +209,33 @@ npm run generate -- --open
 npm run fetch -- --range=month
 
 # Re-build and re-render multiple times (no API calls!)
-npm run build-d3 -- --input-dir=data/raw/2026-03
+npm run build -- --input-dir=output/ynab/2026-03
 npm run render -- --open
 ```
 
-**Force refresh** - Ignore cache and fetch fresh data:
+**Quick build and preview** - Build and open in browser in one command:
 ```bash
-npm run generate -- --force --open
+npm run build:open -- --input-dir=output/ynab/2026-03
 ```
 
 **Custom exclusions** - Hide specific groups from the chart:
 ```bash
-npm run build-d3 -- --input-dir=data/raw/2026-03 --exclude-group="Credit Card Payments"
+npm run build -- --input-dir=output/ynab/2026-03 --exclude-group="Internal Master Category"
+npm run render
 ```
 
 ## Understanding Your Diagram
 
 ### Visual Flow
 
-The Sankey diagram shows a 3-level flow:
+The Sankey diagram shows account-to-category flows with directional arrows:
 
-1. **Inflow (Left)**: "Inflow: Ready to Assign" — your total income for the period
-2. **Pivot Node (Center)**: Date range label with net delta (+$X or -$X)
-3. **Category Groups → Categories (Right)**: How money flows from budget groups into individual spending categories
+1. **Accounts (Left)**: Deposit accounts, credit cards, and investment accounts
+2. **Category Groups (Middle-Left)**: Your budget category groups
+3. **Categories (Middle-Right)**: Individual spending categories
+4. **Liabilities (Right)**: Loans, mortgages, and other debt accounts
 
-Income flows left-to-right through the pivot. Expense groups fan out from the pivot to the right. The visual height of each flow represents its relative dollar amount.
+The visual height of each flow represents its relative dollar amount. Arrows show the direction of money flow.
 
 ### Stats Cards
 
@@ -262,7 +270,7 @@ These defaults live in `src/config.js` and can be extended via CLI `--exclude-gr
 
 ### How Caching Works
 
-When you run `ys-fetch`, it saves four files to `data/raw/<date-key>/`:
+When you run `ys-fetch`, it saves four files to `output/ynab/<date-key>/`:
 - `transactions.json` - Raw YNAB transactions
 - `accounts.json` - Account definitions
 - `categories.json` - Category groups and categories (with summed transaction amounts)
@@ -309,7 +317,7 @@ npm run clear-cache
 ### "Rate limit exceeded"
 
 - YNAB allows 200 API requests per hour
-- Wait an hour, or use cached data with `npm run build-d3` / `npm run render`
+- Wait an hour, or use cached data with `npm run build` / `npm run render`
 
 ### Income/Spending Numbers Look Wrong
 
@@ -323,26 +331,26 @@ npm run generate -- --debug
 ```
 ynab-sankey/
 ├── bin/                          # CLI pipeline scripts
-│   ├── ynab-sankey               # Main orchestrator (fetch → build-d3 → render)
+│   ├── ynab-sankey               # Main orchestrator (fetch → build → render)
 │   ├── ys-fetch                  # Stage 1: YNAB API → cached JSON
-│   ├── ys-build-d3               # Stage 2: Cached JSON → D3 sankey JSON
-│   └── ys-render                 # Stage 3: D3 sankey JSON → HTML
+│   ├── ys-build-plotly           # Stage 2: Cached JSON → Plotly sankey JSON
+│   └── ys-render-plotly          # Stage 3: Plotly sankey JSON → HTML
 │
 ├── src/
 │   ├── config.js                 # Central configuration (env vars, defaults, exclusions)
 │   ├── ynab-api.js               # YNAB REST API client
-│   ├── d3-sankey-template.html   # HTML template with D3.js visualization
+│   ├── plotly-sankey-template.html # HTML template with Plotly.js visualization
 │   └── utils/
 │       ├── cache-manager.js      # Cache validation and path management
 │       ├── date-range.js         # Date parsing and formatting
 │       ├── file-io.js            # JSON read/write helpers
 │       └── format.js             # Monetary formatting (milliunits → USD)
 │
-├── data/                         # Cached data (gitignored)
-│   ├── raw/                      # Stage 1 output (API responses + metadata)
-│   └── processed/                # Stage 2 output (D3 sankey JSON)
+├── output/                       # All cached and generated files (gitignored)
+│   ├── ynab/                     # Stage 1 output (API responses + metadata)
+│   ├── plotly/                   # Stage 2 output (Plotly sankey JSON)
+│   └── render/                   # Stage 3 output (HTML visualizations)
 │
-├── output/                       # Generated HTML files (gitignored)
 ├── .env                          # Your API credentials (gitignored)
 ├── .env.example                  # Template for .env
 └── package.json
@@ -355,7 +363,7 @@ ynab-sankey/
 - Generated HTML contains only aggregated flow data
 - No data sent to external services (except YNAB API)
 - Output files can be safely shared (no credentials)
-- D3.js and d3-sankey loaded from CDN at render time
+- Plotly.js loaded from CDN at render time
 
 ## Customization
 
@@ -370,7 +378,7 @@ defaultExcludedCategories: ['Internal Master Category', 'Transfer Payments']
 
 Or use CLI flags for one-off exclusions:
 ```bash
-npm run build-d3 -- --input-dir=data/raw/2026-03 --exclude-group="My Group"
+npm run build -- --input-dir=output/ynab/2026-03 --exclude-group="My Group"
 ```
 
 ### Transfer Payment Label
@@ -383,10 +391,11 @@ transferCategoryName: 'Transfer Payments',
 
 ### Visual Styling
 
-Edit `src/d3-sankey-template.html` to customize:
-- CSS styles (colors, layout, fonts)
-- D3.js sankey configuration (node width, padding, alignment)
-- Color palettes (uses `d3.schemeTableau10` for groups, `d3.schemePastel1` for categories)
+Edit `src/plotly-sankey-template.html` to customize:
+- CSS styles (colors, layout, fonts, gradients)
+- Plotly configuration (node spacing, arrow size, colors)
+- Account group colors (defined in `ys-build-plotly`)
+- Category color scheme (hash-based for consistency)
 - Stat card layout and formatting
 
 ## Advanced Usage
@@ -395,22 +404,22 @@ Edit `src/d3-sankey-template.html` to customize:
 
 ```bash
 # List all category groups
-cat data/raw/2026-03/categories.json | jq '.[].name'
+cat output/ynab/2026-03/categories.json | jq '.[].name'
 
 # View transaction sums by category
-cat data/raw/2026-03/categories.json | jq '.[].categories[] | select(.sumTransactionAmount) | {name, sumTransactionAmount}'
+cat output/ynab/2026-03/categories.json | jq '.[].categories[] | select(.sumTransactionAmount) | {name, sumTransactionAmount}'
 
 # Check metadata and financial summary
-cat data/raw/2026-03/metadata.json | jq '.'
+cat output/ynab/2026-03/metadata.json | jq '.'
 
-# Inspect the D3 sankey nodes
-cat data/processed/d3-sankey-2026-03.json | jq '.nodes[] | {id, type}'
+# Inspect the Plotly sankey nodes
+cat output/plotly/plotly-sankey-2026-03.json | jq '.plotlyData.node.label'
 
 # Group together all Liabilities
-cat data/raw/2020-01-01_2026-03-04/accounts.json | jq '.[] | select(.type as $a | ["personalLoan", "otherLiability", "mortgage", "autoLoan"] | index($a) ) | {name, type, closed}' 
+cat output/ynab/2020-01-01_2026-03-04/accounts.json | jq '.[] | select(.type as $a | ["personalLoan", "otherLiability", "mortgage", "autoLoan"] | index($a) ) | {name, type, closed}'
 
 # List all of the account types
-cat data/raw/2020-01-01_2026-03-04/accounts.json | jq '.[].type' | sort | uniq
+cat output/ynab/2020-01-01_2026-03-04/accounts.json | jq '.[].type' | sort | uniq
 
 ```
 
@@ -424,19 +433,20 @@ done
 
 ## Roadmap
 
-- [x] D3.js interactive sankey visualization
-- [x] Central pivot node with income/expense delta
-- [x] Financial summary stat cards
+- [x] Plotly.js interactive sankey visualization
+- [x] Account grouping by type
+- [x] Financial summary stat cards (Income, Expenses, Net, CC Payments, Loan Payments)
 - [x] Intelligent caching system
-- [x] Modular 3-stage pipeline (fetch → build-d3 → render)
+- [x] Modular 3-stage pipeline (fetch → build → render)
 - [x] Flexible date ranges
 - [x] Configurable exclusion lists
 - [x] Transfer payment handling
+- [x] Native directional arrows
 - [ ] Budget vs. Actual comparison
 - [ ] Month-to-month trend analysis
-- [ ] Handle negative flows / refunds with side swapping
+- [ ] Interactive filtering (show/hide account groups)
 - [ ] Multiple budget support
-- [ ] PDF/PNG export
+- [ ] PDF/PNG export via headless Plotly
 - [ ] Dark mode toggle
 
 ## License
@@ -446,12 +456,12 @@ MIT License
 ## Support
 
 - [YNAB API Documentation](https://api.ynab.com/)
-- [D3.js Sankey Documentation](https://github.com/d3/d3-sankey)
+- [Plotly.js Documentation](https://plotly.com/javascript/)
 
 ## Acknowledgments
 
 - [YNAB](https://www.ynab.com/) for the excellent budgeting API
-- [D3.js](https://d3js.org/) and [d3-sankey](https://github.com/d3/d3-sankey) for the visualization engine
+- [Plotly.js](https://plotly.com/) for the visualization engine
 
 ---
 

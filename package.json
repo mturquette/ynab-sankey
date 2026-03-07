@@ -3,16 +3,20 @@
   "version": "1.0.0",
   "description": "Visualize YNAB budget data with interactive Sankey diagrams",
   "type": "module",
-  "bin": {
-    "ynab-sankey": "bin/ynab-sankey"
-  },
   "scripts": {
-    "start": "node bin/ynab-sankey",
-    "generate": "node bin/ynab-sankey",
-    "fetch": "node bin/ys-fetch",
-    "build-d3": "node bin/ys-build-d3",
-    "render": "node bin/ys-render",
-    "clear-cache": "rm -rf data"
+    "sankey": "npm run fetch && npm run build && npm run render",
+    "sankey:open": "npm run fetch && npm run build && npm run render -- --open",
+    "sankey:open:month": "node fetch-ynab.js --range=month && node build-plotly.js && node render-plotly.js --open",
+    "sankey:open:ytd": "node fetch-ynab.js --range=ytd && node build-plotly.js && node render-plotly.js --open",
+    "fetch": "node fetch-ynab.js",
+    "fetch:ytd": "node fetch-ynab.js --range=ytd",
+    "fetch:month": "node fetch-ynab.js --range=month",
+    "build": "node build-plotly.js",
+    "build:ytd": "node build-plotly.js --range=ytd",
+    "build:month": "node build-plotly.js --range=month",
+    "render": "node render-plotly.js",
+    "render:open": "npm run render -- --open",
+    "clear-cache": "rm -rf output/ynab output/plotly && mkdir -p output/ynab output/plotly output/render"
   },
   "keywords": ["ynab", "sankey", "budget", "visualization", "finance"],
   "author": "",

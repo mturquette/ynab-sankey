@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 import { join } from 'path';
-import config, { validateConfig } from '../src/config.js';
-import { ynabClient } from '../src/ynab-api.js';
-import { getDateRange } from '../src/utils/date-range.js';
-import { writeJSON } from '../src/utils/file-io.js';
-import { isCacheValid, getCachePath } from '../src/utils/cache-manager.js';
+import config, { validateConfig } from './src/config.js';
+import { ynabClient } from './src/ynab-api.js';
+import { getDateRange } from './src/utils/date-range.js';
+import { writeJSON } from './src/utils/file-io.js';
+import { isCacheValid, getCachePath } from './src/utils/cache-manager.js';
 
 /**
  * ys-fetch
@@ -18,7 +18,7 @@ import { isCacheValid, getCachePath } from '../src/utils/cache-manager.js';
  *   --range=<month|ytd|YYYY-MM-DD|YYYY-MM-DD:YYYY-MM-DD>  Date range (default: month)
  *   --budget-id=<id>         YNAB budget ID (default: from .env)
  *   --force                  Force refresh even if cache valid
- *   --output-dir=<path>      Output directory (default: data/ynab)
+ *   --output-dir=<path>      Output directory (default: output/ynab)
  *   --max-age=<hours>        Cache TTL in hours (default: 24)
  *   --debug                  Enable debug logging
  *   --debugverbose           Enable verbose debug logging (transactions)
